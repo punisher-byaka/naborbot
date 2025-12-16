@@ -1,22 +1,25 @@
-import re
-from urllib.parse import quote
+# app/utils.py
+from __future__ import annotations
 
-# официальный алфавит тегов Clash Royale
-ALLOWED = set("0289PYLQGRJCUV")
 
-TAG_RE = re.compile(r"^[0289PYLQGRJCUV]{3,15}$")
+def normalize_tag(tag: str) -> str:
+    t = (tag or "").strip().upper()
+    if not t:
+        return ""
+    if t.startswith("#"):
+        t = t[1:]
+    if t.startswith("%23"):
+        t = t[3:]
+    return t
 
-def normalize_player_tag(raw: str) -> str:
-    s = (raw or "").upper().replace(" ", "")
-    if s.startswith("#"):
-        s = s[1:]
-
-    # ❗ заменяем O на 0 автоматически
-    s = s.replace("O", "0")
-    return s
-
-def is_valid_tag(tag: str) -> bool:
-    return bool(TAG_RE.match(tag))
 
 def encode_tag_for_url(tag: str) -> str:
-    return quote(f"#{tag}", safe="")
+    """
+    Всегда возвращает тег в формате '%23XXXX'.
+    Защита от двойного кодирования:
+      - 'UC80...' -> '%23UC80...'
+      - '#UC80...' -> '%23UC80...'
+      - '%23UC80...' -> '%23UC80...'
+    """
+    t = normalize_tag(tag)
+    return f"%23{t}" if t else ""
