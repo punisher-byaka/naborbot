@@ -1,6 +1,7 @@
 # app/utils.py
-import re
 from __future__ import annotations
+import re
+
 
 def normalize_player_tag(tag: str) -> str:
     """

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -18,9 +18,16 @@ def normalize_tag(tag: str) -> str:
 
 
 def encode_tag(tag: str) -> str:
-    # Supercell: # -> %23
     tag = normalize_tag(tag)
     return tag.replace("#", "%23")
+
+
+def _first_int(*vals: Any) -> Optional[int]:
+    """Вернёт первое значение типа int (включая 0)."""
+    for v in vals:
+        if isinstance(v, int):
+            return v
+    return None
 
 
 @dataclass
@@ -29,47 +36,36 @@ class CW2WeekEntry:
     week: Optional[int]
     medals: int
     decks_used: int
-    clan_trophies: Optional[int]  # если есть
-    league: Optional[int]         # 1000/2000/3000/4000...
+    clan_trophies: Optional[int]
+    league: Optional[int]
 
 
 def league_from_trophies(t: Optional[int]) -> Optional[int]:
     if t is None:
         return None
-    # грубо: лиги CW2 обычно считаются тысячами трофеев
     return (t // 1000) * 1000
 
 
 class CW2HistoryService:
     """
-    Пытается получить CW2 историю:
-    1) Supercell /riverracelog
-    2) fallback: парс RoyaleAPI /clan/<tag>/war/log (Next.js JSON)
+    1) Supercell: /clans/{tag}/riverracelog
+    2) fallback: RoyaleAPI /clan/<tag>/war/log (Next.js JSON)
     """
 
     def __init__(self, supercell_base: str, supercell_token: str, timeout: float = 12.0):
         self.supercell_base = supercell_base.rstrip("/")
         self.supercell_token = supercell_token
         self.timeout = timeout
+        self._headers = {"Authorization": f"Bearer {self.supercell_token}"}
 
-        self._headers = {
-            "Authorization": f"Bearer {self.supercell_token}",
-        }
-
-    async def get_last_10_weeks(
-        self,
-        clan_tag: str,
-        player_tag: str,
-    ) -> List[CW2WeekEntry]:
+    async def get_last_10_weeks(self, clan_tag: str, player_tag: str) -> List[CW2WeekEntry]:
         clan_tag = normalize_tag(clan_tag)
         player_tag = normalize_tag(player_tag)
 
-        # 1) пробуем Supercell
         weeks = await self._from_supercell(clan_tag, player_tag)
         if weeks:
             return weeks[:10]
 
-        # 2) fallback: RoyaleAPI HTML -> __NEXT_DATA__
         weeks = await self._from_royaleapi(clan_tag, player_tag)
         return weeks[:10]
 
@@ -88,33 +84,47 @@ class CW2HistoryService:
         out: List[CW2WeekEntry] = []
 
         for it in items:
-            # структура Supercell: it["seasonId"], it["sectionIndex"] или "warWeek"/"periodIndex" (в зависимости от версии)
-            season_id = it.get("seasonId")
-            week = it.get("sectionIndex") or it.get("warWeek") or it.get("periodIndex")
+            season_id = _first_int(it.get("seasonId"), it.get("season"))
+            week = _first_int(it.get("sectionIndex"), it.get("warWeek"), it.get("periodIndex"), it.get("week"))
 
             standings = it.get("standings") or []
-            # clan trophies для текущего клана в этом логе
             clan_trophies: Optional[int] = None
-
-            for st in standings:
-                c = st.get("clan") or {}
-                if normalize_tag(c.get("tag", "")) == clan_tag:
-                    clan_trophies = c.get("clanWarTrophies") or c.get("trophies") or None
-                    break
-
             medals = 0
             decks_used = 0
 
-            # игрок может быть в participants одного из standings (обычно в st["clan"]["participants"])
+            # 1) найдём трофеи клана в standings
+            for st in standings:
+                clan_obj = st.get("clan") if isinstance(st, dict) else None
+                if not isinstance(clan_obj, dict):
+                    continue
+
+                if normalize_tag(clan_obj.get("tag", "")) == clan_tag:
+                    # важно: берём int и НЕ теряем 0
+                    clan_trophies = _first_int(
+                        clan_obj.get("clanWarTrophies"),
+                        clan_obj.get("warTrophies"),
+                        clan_obj.get("clan_war_trophies"),
+                        clan_obj.get("trophies"),  # fallback (хуже, но лучше чем None)
+                    )
+                    break
+
+            # 2) найдём игрока в participants
             found = False
             for st in standings:
-                c = st.get("clan") or {}
-                participants = c.get("participants") or []
+                clan_obj = st.get("clan") if isinstance(st, dict) else None
+                if not isinstance(clan_obj, dict):
+                    continue
+
+                participants = clan_obj.get("participants") or st.get("participants") or []
+                if not isinstance(participants, list):
+                    continue
+
                 for p in participants:
+                    if not isinstance(p, dict):
+                        continue
                     if normalize_tag(p.get("tag", "")) == player_tag:
-                        # у Supercell чаще fame/repairPoints/boatAttacks/decksUsed
-                        medals = int(p.get("fame") or 0)
-                        decks_used = int(p.get("decksUsed") or p.get("decks") or 0)
+                        medals = int(p.get("fame") or p.get("medals") or 0)
+                        decks_used = int(p.get("decksUsed") or p.get("decks") or p.get("decks_used") or 0)
                         found = True
                         break
                 if found:
@@ -122,19 +132,18 @@ class CW2HistoryService:
 
             out.append(
                 CW2WeekEntry(
-                    season_id=season_id if isinstance(season_id, int) else None,
-                    week=week if isinstance(week, int) else None,
+                    season_id=season_id,
+                    week=week,
                     medals=medals,
                     decks_used=decks_used,
-                    clan_trophies=clan_trophies if isinstance(clan_trophies, int) else None,
-                    league=league_from_trophies(clan_trophies if isinstance(clan_trophies, int) else None),
+                    clan_trophies=clan_trophies,
+                    league=league_from_trophies(clan_trophies),
                 )
             )
 
         return out
 
     async def _from_royaleapi(self, clan_tag: str, player_tag: str) -> List[CW2WeekEntry]:
-        # RoyaleAPI использует тег без # в URL
         clan_no_hash = clan_tag.replace("#", "")
         url = f"https://royaleapi.com/clan/{clan_no_hash}/war/log"
 
@@ -147,7 +156,6 @@ class CW2HistoryService:
         except Exception:
             return []
 
-        # Next.js JSON
         m = re.search(r'<script id="__NEXT_DATA__" type="application/json">\s*(\{.*?\})\s*</script>', html, re.S)
         if not m:
             return []
@@ -157,37 +165,33 @@ class CW2HistoryService:
         except Exception:
             return []
 
-        # Дальше самое “скользкое”: структура next-data может меняться.
-        # Делаем максимально мягкий поиск: пробегаем по JSON и ищем объекты,
-        # похожие на warlog items (имеют standings/participants и season/week).
         items = self._find_warlog_items(blob)
         if not items:
             return []
 
         out: List[CW2WeekEntry] = []
         for it in items[:10]:
-            season_id = it.get("seasonId") or it.get("season")
-            week = it.get("week") or it.get("sectionIndex") or it.get("warWeek") or it.get("periodIndex")
+            season_id = _first_int(it.get("seasonId"), it.get("season"))
+            week = _first_int(it.get("week"), it.get("sectionIndex"), it.get("warWeek"), it.get("periodIndex"))
 
             standings = it.get("standings") or it.get("items") or it.get("clans") or []
             clan_trophies: Optional[int] = None
             medals = 0
             decks_used = 0
 
-            # пытаемся извлечь “наш клан” и “нашего игрока”
             for st in standings:
-                # варианты: st["clan"] или st сам clan-object
                 clan_obj = st.get("clan") if isinstance(st, dict) else None
                 if clan_obj is None and isinstance(st, dict) and "tag" in st:
                     clan_obj = st
-
                 if not isinstance(clan_obj, dict):
                     continue
 
                 if normalize_tag(clan_obj.get("tag", "")) == clan_tag:
-                    ct = clan_obj.get("clanWarTrophies") or clan_obj.get("trophies")
-                    if isinstance(ct, int):
-                        clan_trophies = ct
+                    clan_trophies = _first_int(
+                        clan_obj.get("clanWarTrophies"),
+                        clan_obj.get("warTrophies"),
+                        clan_obj.get("trophies"),
+                    )
 
                 participants = clan_obj.get("participants") or st.get("participants") or []
                 if isinstance(participants, list):
@@ -200,8 +204,8 @@ class CW2HistoryService:
 
             out.append(
                 CW2WeekEntry(
-                    season_id=season_id if isinstance(season_id, int) else None,
-                    week=week if isinstance(week, int) else None,
+                    season_id=season_id,
+                    week=week,
                     medals=medals,
                     decks_used=decks_used,
                     clan_trophies=clan_trophies,
@@ -212,14 +216,10 @@ class CW2HistoryService:
         return out
 
     def _find_warlog_items(self, obj: Any) -> List[Dict[str, Any]]:
-        """
-        Рекурсивно ищем список объектов, похожих на записи river race log.
-        """
         found: List[Dict[str, Any]] = []
 
         def walk(x: Any):
             if isinstance(x, dict):
-                # эвристика "похоже на warlog item"
                 if ("standings" in x and isinstance(x.get("standings"), list)) and (
                     "seasonId" in x or "week" in x or "sectionIndex" in x or "periodIndex" in x
                 ):
@@ -231,7 +231,4 @@ class CW2HistoryService:
                     walk(v)
 
         walk(obj)
-
-        # часто items лежат списком — сортировать “по времени” без поля сложно,
-        # поэтому возвращаем как найдено; на практике Next.js хранит уже в нужном порядке.
         return found
