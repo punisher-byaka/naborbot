@@ -1,6 +1,27 @@
 # app/utils.py
+import re
 from __future__ import annotations
 
+def normalize_player_tag(tag: str) -> str:
+    """
+    Приводит тег к формату #XXXXXXXX
+    """
+    if not tag:
+        return ""
+    tag = tag.strip().upper()
+    if not tag.startswith("#"):
+        tag = "#" + tag
+    return tag
+
+
+def is_valid_tag(tag: str) -> bool:
+    """
+    Проверка тега Clash Royale
+    """
+    if not tag:
+        return False
+    tag = normalize_player_tag(tag)
+    return bool(re.fullmatch(r"#[A-Z0-9]{6,}", tag))
 
 def normalize_tag(tag: str) -> str:
     t = (tag or "").strip().upper()
